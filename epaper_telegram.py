@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from contextlib import ExitStack
 import datetime
 import gc
 import os
@@ -18,6 +19,7 @@ sys.stdout.reconfigure(line_buffering=True)
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"].strip()
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()
 MAX_TELEGRAM_BYTES = 48 * 1024 * 1024  # 48 MB safety buffer (Telegram cap is 50 MB)
+MAX_THUMB_BYTES = 195 * 1024           # 200 KB Telegram thumbnail cap
 
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
@@ -162,7 +164,7 @@ class StreamingPDFWriter:
 
 
 def run_startup_checks():
-    print("1/2 Checking Telegram bot credentials...", flush=True)
+    print("1/3 Checking Telegram bot credentials...", flush=True)
     try:
         r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe", timeout=(10, 15))
         if r.status_code != 200:
@@ -174,7 +176,24 @@ def run_startup_checks():
         print(f"ERROR: Could not reach Telegram API: {e}", flush=True)
         sys.exit(1)
 
-    print("2/2 Checking epaper.gujaratsamachar.com reachability...", flush=True)
+    print("2/3 Verifying target TELEGRAM_CHAT_ID...", flush=True)
+    try:
+        r = requests.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/getChat",
+            params={"chat_id": CHAT_ID},
+            timeout=(10, 15),
+        )
+        if r.status_code != 200:
+            print(f"ERROR: Invalid TELEGRAM_CHAT_ID ({r.status_code}): {r.text}", flush=True)
+            sys.exit(1)
+        chat_info = r.json().get("result", {})
+        chat_label = chat_info.get("title") or chat_info.get("username") or chat_info.get("first_name")
+        print(f"OK: Verified target chat -> {chat_label}", flush=True)
+    except Exception as e:
+        print(f"ERROR: Could not verify chat: {e}", flush=True)
+        sys.exit(1)
+
+    print("3/3 Checking epaper.gujaratsamachar.com reachability...", flush=True)
     try:
         r = requests.get(
             "https://epaper.gujaratsamachar.com/",
@@ -184,15 +203,30 @@ def run_startup_checks():
         soup = BeautifulSoup(r.text, "html.parser")
         title = soup.title.string.strip() if soup.title and soup.title.string else "No Title"
         print(f"Site response: HTTP {r.status_code} | Title: {title}", flush=True)
-        if r.status_code == 403 or "just a moment" in title.lower():
-            print("WARNING: Site appears to be blocking or challenging GitHub's server IP.", flush=True)
     except Exception as e:
         print(f"ERROR: Site unreachable from GitHub runner: {e}", flush=True)
         sys.exit(1)
 
 
+def save_telegram_thumbnail(pil_img, thumb_path):
+    """Creates a <=320x320 JPEG under 200 KB from Page 1 without modifying the original image."""
+    thumb_img = pil_img.copy()
+    try:
+        if thumb_img.mode != "RGB":
+            thumb_img = thumb_img.convert("RGB")
+        thumb_img.thumbnail((320, 320), Image.Resampling.LANCZOS)
+        for q in (85, 70, 55):
+            thumb_img.save(thumb_path, format="JPEG", quality=q, optimize=True)
+            if os.path.getsize(thumb_path) <= MAX_THUMB_BYTES:
+                return thumb_path
+        return thumb_path
+    finally:
+        thumb_img.close()
+
+
 def fetch_edition_pdf(keyword, date_str, out_dir, compress=False):
     pdf_path = os.path.join(out_dir, f"{keyword}_{date_str}.pdf")
+    thumb_path = None
     base_url = f"https://epaper.gujaratsamachar.com/{keyword}/{date_str}"
     seen_urls = set()
     page_num = 1
@@ -251,6 +285,11 @@ def fetch_edition_pdf(keyword, date_str, out_dir, compress=False):
 
             raw_data = img_resp.content
             with Image.open(BytesIO(raw_data)) as pil_img:
+                # Generate front-page thumbnail from Page 1
+                if page_num == 1 and thumb_path is None:
+                    candidate_thumb = os.path.join(out_dir, f"{keyword}_{date_str}_thumb.jpg")
+                    thumb_path = save_telegram_thumbnail(pil_img, candidate_thumb)
+
                 w, h = pil_img.size
                 is_baseline_rgb = (
                     pil_img.format == "JPEG"
@@ -285,28 +324,37 @@ def fetch_edition_pdf(keyword, date_str, out_dir, compress=False):
 
         if writer and writer.page_count > 0:
             writer.finalize()
-            return pdf_path, writer.page_count
+            return pdf_path, writer.page_count, thumb_path
 
         if writer:
             writer.abort()
-        if os.path.exists(pdf_path):
-            os.remove(pdf_path)
-        return None, 0
+        for fpath in (pdf_path, thumb_path):
+            if fpath and os.path.exists(fpath):
+                os.remove(fpath)
+        return None, 0, None
     finally:
         session.close()
 
 
-def send_telegram_document(filepath, caption):
+def send_telegram_document(filepath, caption, thumb_path=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
     size_mb = os.path.getsize(filepath) / (1024 * 1024)
     print(f"  Uploading {os.path.basename(filepath)} ({size_mb:.1f} MB) to Telegram...", flush=True)
     for attempt in range(1, 4):
         try:
-            with open(filepath, "rb") as doc:
+            with ExitStack() as stack:
+                doc = stack.enter_context(open(filepath, "rb"))
+                files = {
+                    "document": (os.path.basename(filepath), doc, "application/pdf")
+                }
+                if thumb_path and os.path.exists(thumb_path):
+                    thumb = stack.enter_context(open(thumb_path, "rb"))
+                    files["thumbnail"] = ("thumb.jpg", thumb, "image/jpeg")
+
                 resp = requests.post(
                     url,
                     data={"chat_id": CHAT_ID, "caption": caption},
-                    files={"document": (os.path.basename(filepath), doc, "application/pdf")},
+                    files=files,
                     timeout=(15, 120),
                 )
             if resp.status_code == 200:
@@ -346,7 +394,7 @@ def main():
             guj_name = GUJARATI_NAMES.get(kw, kw.title())
             print(f"[{idx}/{len(targets)}] Fetching {kw}...", flush=True)
 
-            pdf_path, pages = fetch_edition_pdf(kw, today_str, tmp_dir, compress=False)
+            pdf_path, pages, thumb_path = fetch_edition_pdf(kw, today_str, tmp_dir, compress=False)
             if not pdf_path:
                 print(f"  Skipped {kw} (not published / holiday).", flush=True)
                 continue
@@ -354,17 +402,24 @@ def main():
             if os.path.getsize(pdf_path) > MAX_TELEGRAM_BYTES:
                 print(f"  {kw} exceeded 48 MB; rebuilding compressed version...", flush=True)
                 os.remove(pdf_path)
-                pdf_path, pages = fetch_edition_pdf(kw, today_str, tmp_dir, compress=True)
+                if thumb_path and os.path.exists(thumb_path):
+                    os.remove(thumb_path)
+                pdf_path, pages, thumb_path = fetch_edition_pdf(kw, today_str, tmp_dir, compress=True)
 
             if pdf_path and os.path.getsize(pdf_path) <= MAX_TELEGRAM_BYTES:
                 caption = f"📰 {guj_name} ({guj_day}, {today_str}) | {pages} પેજ"
-                if send_telegram_document(pdf_path, caption):
+                if send_telegram_document(pdf_path, caption, thumb_path=thumb_path):
                     sent_count += 1
-                    print(f"  OK: Sent {kw} ({pages} pages) to Telegram.", flush=True)
-                os.remove(pdf_path)
+                    print(f"  OK: Sent {kw} ({pages} pages) with thumbnail.", flush=True)
+                for fpath in (pdf_path, thumb_path):
+                    if fpath and os.path.exists(fpath):
+                        os.remove(fpath)
                 time.sleep(3)
             else:
                 print(f"  Skipped {kw}: still above Telegram 50 MB limit.", flush=True)
+                for fpath in (pdf_path, thumb_path):
+                    if fpath and os.path.exists(fpath):
+                        os.remove(fpath)
 
     print(f"Done. Delivered {sent_count}/{len(targets)} editions.", flush=True)
 
