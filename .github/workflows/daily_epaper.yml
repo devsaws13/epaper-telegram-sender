@@ -1,9 +1,9 @@
 name: Daily Gujarat Samachar to Telegram
 
 on:
-  schedule:
+  # schedule:
     # 01:15 UTC = 6:45 AM IST daily (using :15 avoids GitHub's :00 top-of-hour queue delays)
-    - cron: '15 1 * * *'
+    # - cron: '15 1 * * *'
   workflow_dispatch: # Lets you click "Run workflow" manually to test anytime
 
 jobs:
