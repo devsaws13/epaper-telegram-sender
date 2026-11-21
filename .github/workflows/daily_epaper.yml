@@ -25,6 +25,7 @@ jobs:
 
       - name: Fetch editions and send to Telegram
         env:
+          PYTHONUNBUFFERED: "1"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python epaper_telegram.py
+        run: python -u epaper_telegram.py
